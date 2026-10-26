@@ -30,8 +30,14 @@ Last reviewed: 2026-10-26. This file is the single place where claims about the 
 | RACE SDK version (`0x0301`) and build version (`0x1E08`) queries | No reply | Live test 2026-10-26 on firmware 2.5.0, after the update-mode handshake: no response, while a page read on the same connection worked. |
 | RACE page-read response layout | Device-verified | 270-byte frame: 6-byte header + 8 bytes (status `0x00`, …, address) + 256 bytes of data. Data starts at byte 14. |
 | RACE READ_ADDRESS (`0x1680`) reads 4 bytes from any memory address | Device-verified | Live test 2026-10-26 on firmware 2.5.0. Read SRAM at `0x04000000`–`0x0400000C` (vector table: SP=`0x04004000`, Reset=`0x081B9001`, NMI=`0x100001C9`, HardFault=`0x100001D7`). Payload: `\x00\x00` + LE address. Response: 6-byte header + ret(1) + unk(2) + addr(4) + data(4). |
-| RACE WRITE_ADDRESS (`0x1681`) writes 4 bytes to an address | Exists, unverified | Live test 2026-10-26: returns `ret=0` but readback at `0x04080F00` unchanged. That address is outside SRAM (SP=`0x04004000` ≈ 16 KB). A test within confirmed SRAM has not been done. |
-| ATCI tunnel (`0x0F92`) on retail firmware 2.5.0 | **Dead** | Live test 2026-10-26: `AT\r\n` and `ATI\r\n` sent over `0x0F92` produced no response. The `AT+HWPTOOL=COEFSET` path is not viable on v2.5.0. |
+| RACE WRITE_ADDRESS (`0x1681`) writes 4 bytes to an address | **Device-verified** | Live test 2026-10-26: wrote `0xCAFEBABE` to coefficient buffer word[1] at `0x1001A7BC`, readback returned `0xBEBAFECA` (LE representation of the BE value). Original zero restored and verified. Earlier test at `0x04080F00` failed because that address is outside SRAM. |
+| ATCI tunnel (`0x0F92`) on retail firmware 2.5.0 | **Dead** | Live test 2026-10-26: `AT\r\n` and `ATI\r\n` sent over `0x0F92` produced no response. The `AT+HWPTOOL=COEFSET` path is not viable on v2.5.0 via this opcode. |
+| RACE relay mode (`0x020C`) enables ATCI | Device-verified | Live test 2026-10-26: sending `0x020C` returns success (`00`), after which `0x0A00` ATCI tunnel commands return `00 00 XX` instead of error `0x11`. Before relay: `0x0A00` returns error code `0x11`. After relay: AT commands accepted. Tested `AT`, `ATI`, `AT+HWPTOOL=COEFSET`, `AT+HWPTOOL=COEFDUMP`, `AT+NCOPTTOOL=NCOPTDUMP`, `AT+NCOPTTOOL=NCOPTSET`, `AT+CXD90050=REG_READ,0x0000`. All return only 3-byte payloads; no indication packets follow. Relay disable is `0x020D`. |
+| RACE NVDM write (`0x0E02`) | **Non-functional** | Live test 2026-10-26: tested ~15 different payload formats (1-byte to 16-byte, with/without group+item strings, with/without storage type). All return single-byte `00` RSP. Readback of flash page after write showed value unchanged. The handler appears to be a stub or disabled. |
+| RACE PAGE_PROGRAM (`0x0402`) for all storage types | **Blocked** | Live test 2026-10-26: tested storage_type 0 through 4 at various addresses. All return `rc=0x0A`. Flash writing is completely blocked via RACE on retail firmware. |
+| NVDM is NOT in main NOR flash | Device-verified | Live test 2026-10-26: full 4 MB NOR scan (1024 × 4 KB blocks, `storage_type=0x00`) found zero NVDM blocks (no `NVDM` magic). NVDM uses its own virtual address space (`storage_type=0x01`, starting at `0x00000000`). The physical storage is likely AB1562 internal flash, not the external NOR. |
+| READ_ADDRESS/WRITE_ADDRESS regression | Observed | 2026-10-26: all `0x1680` reads return `rc=3` and value `0xFFFFFFFF` after some point in the session. Earlier in the same session, reads worked correctly (coefficient buffer at `0x1001A7B8` returned valid data, `0x10004048` returned `0x00000013`). Root cause unknown — may be a session state issue or firmware protection that activates after repeated access. |
+| DSP realtime RACE commands (`0x0CD1`–`0x0CD4`) | Device-verified (responsive) | Live test 2026-10-26: these commands return responses (not error/no-reply). Their function is unknown — they may be DSP pass-through commands. Investigation pending. |
 | Firmware signature is RSA-2048 checked against eFuses | Unverified | No source. The flasher only shows that the device ran an integrity check (`0x1C01`) and accepted an official image. |
 
 ## Firmware reverse engineering
@@ -67,7 +73,8 @@ Key RAM addresses from decompilation:
 | Address | What | Evidence |
 |---|---|---|
 | `0x10004048` | CXD90050 NC state struct base | Global pointer `DAT_082b1acc`. Live read returned `0x00000013` at offset 0 (state field, not pointer). |
-| `0x100040C8` | Pointer to 40-byte coefficient heap buffer | `*(struct + 0x80)`. Not yet read from live device (headset was off). This is the key address for inject. |
+| `0x100040C8` | Pointer to 40-byte coefficient heap buffer | `*(struct + 0x80)`. **Live read: `*(0x100040C8) = 0x1001A7B8`** — this is the heap-allocated coefficient buffer. 40 bytes read: identity biquad `[0x10000000, 0, 0, 0, 0, 0x10000000, 0, 0, 0, 0]` (big-endian Q4.28, where 0x10000000 = 1.0). |
+| `0x1001A7B8` | Live coefficient buffer (40 bytes, heap) | **Device-verified**. Contains 2 × 5 Q4.28 biquad coefficients in big-endian. READ_ADDRESS returns LE words, so `0x10000000` BE reads as `0x00000010` LE. WRITE_ADDRESS verified: wrote test pattern, readback matched, original restored. **This is the inject target.** |
 | `0x100798B4` | `optimizer_is_optimized` flag | Zeroed in `FUN_082bb5d8`. Live read confirmed: `0x00000000`. |
 | `0x100797AC` | CXD90050 state flags | `DAT_082b0360`. Bit 0 at `+4` set after coefficient update. Live read: `0x00B313FF`. |
 
@@ -89,7 +96,27 @@ The decompilation reveals the complete coefficient pipeline. Two inject paths:
 1. Call `FUN_082a144c` indirectly by writing coefficients to the buffer and triggering the coefficient-update flag at `0x100797B0` (bit 0).
 2. This applies coefficients to the DSP immediately, without waiting for power cycle.
 
-**Remaining blockers:** (a) WRITE_ADDRESS (`0x1681`) not yet verified in `0x10xxxxxx` RAM range, (b) `*(0x100040C8)` not yet read from live device (headset was off during last test).
+**Both blockers cleared (2026-10-26):**
+- ✓ `*(0x100040C8) = 0x1001A7B8` — coefficient buffer address read from live device.
+- ✓ WRITE_ADDRESS verified at `0x1001A7BC` (buffer word[1]) — wrote `0xCAFEBABE`, readback confirmed, original restored.
+- **Remaining:** Write full custom biquad to buffer, verify DSP picks it up (listening test), verify persistence across power cycle.
+
+**Write path status (2026-10-26, all tested):**
+
+| Path | Status | Detail |
+|---|---|---|
+| RACE NVDM write (`0x0E02`) | **FAILED** | Returns `00` for all payload formats, but does not actually write. Flash readback unchanged. |
+| RACE PAGE_PROGRAM (`0x0402`) | **FAILED** | Returns `rc=0x0A` for storage types 0–4. Flash writing completely blocked. |
+| Physical NOR flash write | **N/A** | NVDM is not in external NOR — it's in AB1562 internal flash. |
+| ATCI COEFSET via relay mode | **Accepted, unverified** | `AT+HWPTOOL=COEFSET,<hex>` returns `00 00 54` ('T'=accepted) after enabling relay via `0x020C`. Cannot verify DSP effect because (a) response is truncated to 3 bytes, (b) READ_ADDRESS regression prevents reading coefficient buffer, (c) no listening test done. |
+| ATCI NCOPTSET via relay mode | **Accepted, unverified** | Same status as COEFSET. |
+| RAM WRITE_ADDRESS (`0x1681`) | **Verified writes, but DSP pickup unknown** | Can write to coefficient buffer at `0x1001A7B8`. Whether the DSP reads from this buffer in real time or only at specific events (NC toggle, power cycle) is unknown. READ_ADDRESS regression prevents verification. |
+| DSP realtime (`0x0CD1`–`0x0CD4`) | **Unexplored** | These commands respond; their payload format and function are unknown. |
+
+**Next steps to resolve:**
+1. **Listening test with ATCI COEFSET** — send identity-passthrough coefficients (`b0=1, rest=0`) via relay mode → COEFSET, then check if ANC behavior changes audibly.
+2. **Investigate DSP realtime commands** — probe `0x0CD1`–`0x0CD4` with varying payloads to determine if they can read/write DSP state.
+3. **Fresh connection for READ_ADDRESS** — reconnect to clear the `rc=3` regression and verify coefficient buffer state after COEFSET.
 
 ## ANC calibration (`inject`, `verify`, `rollback`)
 
@@ -106,7 +133,7 @@ The decompilation reveals the complete coefficient pipeline. Two inject paths:
 | "+6.5 to +7.5 dB extra low-frequency noise reduction" | Code/simulation | This is the simulated magnitude response of the synthesized filter. It is not an ANC measurement. Real noise reduction depends on the acoustic paths, which were never measured. |
 | A bad NVDM checksum cannot bootloop the headset (ROM fallback) | Unverified | No source or test. |
 | Rollback restores the dump "bit-exact" | Unverified | The rollback path only issues page-program commands. NOR flash cannot turn 0 bits back into 1 without an erase, and the emulator in `virtual_device.py` hides this. |
-| `AT+HWPTOOL=COEFSET` / `AT+ENVDM` ATCI commands | **Dead on v2.5.0** | These strings exist in the firmware v3.0.1 image. On retail v2.5.0 the ATCI tunnel (`0x0F92`) itself produces no response, so these commands cannot be reached. Status on v3.0.1 is unknown but untestable (device is on v2.5.0). |
+| `AT+HWPTOOL=COEFSET` / `AT+ENVDM` ATCI commands | **Dead on v2.5.0 via 0x0F92; partially alive via relay mode** | `0x0F92` produces no response on retail v2.5.0. However, RACE relay mode (`0x020C`) enables ATCI via `0x0A00`: AT commands return 3-byte RSP `00 00 XX` where XX is `07` (basic AT), `4F` ('O', dump commands), or `54` ('T', SET commands). Full AT response text is NOT returned — only the 3-byte status. COEFSET and NCOPTSET return `00 00 54` (accepted), but the DSP effect is unverified (no listening test done). The truncated response may mean the AT text goes to UART, not BT. |
 
 Code facts about the old write paths (confirmed by reading the code after a user report, 2026-10-26):
 
