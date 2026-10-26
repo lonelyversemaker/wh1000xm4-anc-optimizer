@@ -42,7 +42,7 @@ Key sections from the MOVER_INFO table:
 | 5 | — | — | `0x0C480000` | Possibly DSP code |
 | 6 | — | — | `0x0C490000` | Possibly DSP code |
 
-Decryption requires an AES-128-CBC key and IV specific to the WH-1000XM4. Tools: [ramikg/airoha-firmware-parser](https://github.com/ramikg/airoha-firmware-parser), [auracast-research/airoha-fota-mod](https://github.com/auracast-research/airoha-fota-mod). The [HelgeSverre/sony-vp-extract](https://github.com/HelgeSverre/sony-vp-extract) project extracted a similar key from the MT2811 by reading the firmware's FOTA decryption routine via the same RACE READ_ADDRESS (`0x1680`) we have.
+The AES-128-CBC key and IV published by [HelgeSverre/sony-vp-extract](https://github.com/HelgeSverre/sony-vp-extract) decrypted the official WH-1000XM4 v2.5.0 and v3.0.1 FOTA images in an offline test on 2026-10-26. Both decrypted streams decompressed as LZMA, and all per-section SHA-256 digests matched their FOTA headers. [ramikg/airoha-firmware-parser](https://github.com/ramikg/airoha-firmware-parser) documents the TLV and section layout. This confirms access to the image contents, not which code paths implement ANC or whether ANC attenuation changed.
 
 ## 2. NVDM store as seen over RACE
 
