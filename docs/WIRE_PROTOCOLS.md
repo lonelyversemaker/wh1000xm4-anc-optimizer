@@ -108,6 +108,28 @@ def compute_fota_checksum(data: bytes) -> int:
     return rev
 ```
 
+### 3.3b RAM Read/Write Opcodes
+
+| Opcode (`cmd_id`) | Name | Request Payload | Response Payload | Level |
+|---|---|---|---|---|
+| `0x1680` | `READ_ADDRESS` | `\x00\x00` + `<I` (LE address) | 6-byte header + `ret(1)` + `unk(2)` + `addr(4)` + `data(4)` | **Device-verified** |
+| `0x1681` | `WRITE_ADDRESS` | `\x00\x00` + `<I` (LE address) + `data(4)` | 6-byte header + `ret(1)` + ... | Exists, **unverified** |
+
+**READ_ADDRESS (0x1680)** — Device-verified on firmware 2.5.0, 2026-10-26. Reads 4 bytes from any address in the MT2811 memory map. Confirmed reads from SRAM (0x04000000–0x0400000C) and code regions (0x08000000+, 0x10000000+). The vector table at 0x00000000 reveals:
+
+| Vector | Address | Note |
+|---|---|---|
+| SP (initial) | `0x04004000` | Top of ~16 KB SRAM |
+| Reset | `0x081B9001` | Thumb bit set; entry at 0x081B9000 |
+| NMI | `0x100001C9` | Second code region |
+| HardFault | `0x100001D7` | Second code region |
+
+**WRITE_ADDRESS (0x1681)** — Returns `ret=0` (accepted) but a write to `0x04080F00` did not change the readback value. This address is likely outside the actual SRAM (SP=0x04004000 implies ~16 KB from 0x04000000). A proper test within the confirmed SRAM range (0x04000000–0x04004000) has not been done yet. If writes work, the inject strategy is: write custom `optimizer_coeff` to the RAM buffer → firmware saves RAM→NVDM at power off → persistent.
+
+### 3.3c ATCI Tunnel Status
+
+**ATCI (0x0F92)** — **Dead on retail firmware 2.5.0.** Live test 2026-10-26: sending `AT\r\n` and `ATI\r\n` over RACE opcode `0x0F92` produced no response (timeout). The ATCI tunnel may be disabled in retail firmware. The `AT+HWPTOOL=COEFSET` path documented below is therefore not viable on v2.5.0.
+
 ### 3.4 ATCI DSP Coefficient Commands (`0x0F92`)
 
 > **Unverified.** The strings `AT+HWPTOOL=COEFSET` and `AT+ENVDM` exist in the firmware v3.0.1 image, but the argument format below was never confirmed and it is unknown whether retail firmware accepts ATCI over RACE. Do not rely on these commands.

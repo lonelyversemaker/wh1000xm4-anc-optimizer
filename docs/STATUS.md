@@ -29,7 +29,31 @@ Last reviewed: 2026-10-26. This file is the single place where claims about the 
 | `bluetoothctl info` Modalias encodes the firmware version | Partly verified | `usb:v054Cp0D58d0250` on a unit whose MDR firmware string is `2.5.0`. Other versions not checked. |
 | RACE SDK version (`0x0301`) and build version (`0x1E08`) queries | No reply | Live test 2026-10-26 on firmware 2.5.0, after the update-mode handshake: no response, while a page read on the same connection worked. |
 | RACE page-read response layout | Device-verified | 270-byte frame: 6-byte header + 8 bytes (status `0x00`, …, address) + 256 bytes of data. Data starts at byte 14. |
+| RACE READ_ADDRESS (`0x1680`) reads 4 bytes from any memory address | Device-verified | Live test 2026-10-26 on firmware 2.5.0. Read SRAM at `0x04000000`–`0x0400000C` (vector table: SP=`0x04004000`, Reset=`0x081B9001`, NMI=`0x100001C9`, HardFault=`0x100001D7`). Payload: `\x00\x00` + LE address. Response: 6-byte header + ret(1) + unk(2) + addr(4) + data(4). |
+| RACE WRITE_ADDRESS (`0x1681`) writes 4 bytes to an address | Exists, unverified | Live test 2026-10-26: returns `ret=0` but readback at `0x04080F00` unchanged. That address is outside SRAM (SP=`0x04004000` ≈ 16 KB). A test within confirmed SRAM has not been done. |
+| ATCI tunnel (`0x0F92`) on retail firmware 2.5.0 | **Dead** | Live test 2026-10-26: `AT\r\n` and `ATI\r\n` sent over `0x0F92` produced no response. The `AT+HWPTOOL=COEFSET` path is not viable on v2.5.0. |
 | Firmware signature is RSA-2048 checked against eFuses | Unverified | No source. The flasher only shows that the device ran an integrity check (`0x1C01`) and accepted an official image. |
+
+## Firmware reverse engineering
+
+| Claim | Level | Evidence / note |
+|---|---|---|
+| v2.5.0 FOTA image is LZMA_AES encrypted, 7 sections | Device-verified (header parse) | Header at offset 0 parsed with [ramikg/airoha-firmware-parser](https://github.com/ramikg/airoha-firmware-parser) 010 template. Compression type: LZMA_AES. Firmware data at offset `0x1000`, size 1,391,408 bytes. |
+| Main firmware loads at `0x1B9000` | Device-verified (cross-check) | Section 4: `dest=0x001B9000`, decompressed size `0x19D000` (~1.7 MB). Matches Reset vector `0x081B9001` read via `0x1680`. |
+| DSP code sections at `0x0C480000` / `0x0C490000` | Parsed, unverified | Sections 5–6 target these addresses. Possibly CXD90050 DSP code (hypothesis). |
+| MT2811 memory map from vector table | Device-verified | SP=`0x04004000` (SRAM), code region 1 at `0x08xxxxxx`, code region 2 at `0x10xxxxxx`. Flash-mapped code appears at `0x08000000`+. |
+| AES-128-CBC key/IV needed for decryption | Blocking | [ramikg/airoha-firmware-parser](https://github.com/ramikg/airoha-firmware-parser) requires `--key` and `--iv` (16-byte hex each). The key is device/product specific, not in the FOTA header. [HelgeSverre/sony-vp-extract](https://github.com/HelgeSverre/sony-vp-extract) extracted a key from the MT2811 by dumping the FOTA decryption routine via BLE RACE — the same READ_ADDRESS primitive we have. [auracast-research/airoha-fota-mod](https://github.com/auracast-research/airoha-fota-mod) is another FOTA extract/repack tool. |
+| All 5 official FOTA images downloaded | Verified (SHA-256) | v2.5.0, v2.6.0, v2.7.1, v2.9.0, v3.0.1 from [lzghzr/MDR_Proxy](https://github.com/lzghzr/MDR_Proxy). All LZMA_AES encrypted. |
+
+### Inject strategy (hypothesis)
+
+The RAM READ primitive (`0x1680`) and the firmware's power-off NVDM save behavior suggest an inject path:
+
+1. **Find `optimizer_coeff` RAM address** — either by scanning SRAM for the identity biquad pattern (`0x10000000, 0, 0, 0, 0, 0x10000000, 0, 0, 0, 0`) or by disassembling the decrypted firmware in Ghidra and finding the buffer referenced by the `"Cannot write optimizer coeff to nvdm"` string.
+2. **Write custom coefficients to RAM** — via WRITE_ADDRESS (`0x1681`), if writes to valid SRAM addresses work (untested within confirmed range).
+3. **Firmware saves RAM→NVDM at power off** — the custom values become persistent without touching flash directly.
+
+**Blockers:** (a) WRITE_ADDRESS not yet verified in valid SRAM, (b) `optimizer_coeff` RAM address unknown, (c) firmware AES key needed for Ghidra disassembly.
 
 ## ANC calibration (`inject`, `verify`, `rollback`)
 
@@ -46,7 +70,7 @@ Last reviewed: 2026-10-26. This file is the single place where claims about the 
 | "+6.5 to +7.5 dB extra low-frequency noise reduction" | Code/simulation | This is the simulated magnitude response of the synthesized filter. It is not an ANC measurement. Real noise reduction depends on the acoustic paths, which were never measured. |
 | A bad NVDM checksum cannot bootloop the headset (ROM fallback) | Unverified | No source or test. |
 | Rollback restores the dump "bit-exact" | Unverified | The rollback path only issues page-program commands. NOR flash cannot turn 0 bits back into 1 without an erase, and the emulator in `virtual_device.py` hides this. |
-| `AT+HWPTOOL=COEFSET` / `AT+ENVDM` ATCI commands | Unverified | These strings exist in the firmware v3.0.1 image. Their argument format and whether retail firmware accepts them over RACE are unknown. |
+| `AT+HWPTOOL=COEFSET` / `AT+ENVDM` ATCI commands | **Dead on v2.5.0** | These strings exist in the firmware v3.0.1 image. On retail v2.5.0 the ATCI tunnel (`0x0F92`) itself produces no response, so these commands cannot be reached. Status on v3.0.1 is unknown but untestable (device is on v2.5.0). |
 
 Code facts about the old write paths (confirmed by reading the code after a user report, 2026-10-26):
 

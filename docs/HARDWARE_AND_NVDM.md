@@ -13,6 +13,37 @@ This document describes what is known about the WH-1000XM4 storage that the tool
 | Partition map (bootloader, FOTA, voice prompts at `0x00510000`) | Unverified | No partition table has been read and published yet. |
 | Public schematics or service manual | Not found | FCC ID is likely `AK8WH1000XM4` ([fccid.io](https://fccid.io/AK8WH1000XM4)); the board is reported as HDX-2943. No public schematic was found. |
 
+## 1b. MT2811 Memory Map (from live RAM reads)
+
+Device-verified on firmware 2.5.0 using RACE READ_ADDRESS (`0x1680`), 2026-10-26:
+
+| Region | Address range | Evidence |
+|---|---|---|
+| **Vector table** | `0x00000000` | SP=`0x04004000`, Reset=`0x081B9001`, NMI=`0x100001C9`, HardFault=`0x100001D7` |
+| **SRAM** | `0x04000000`–`0x04003FFF` (16 KB) | SP points to top of this region. Reads at `0x04000000`–`0x0400000C` returned non-zero data. Reads at `0x04008000`+ returned all zeros. |
+| **Flash-mapped code (region 1)** | `0x08000000`+ | Reset vector entry. FOTA section 4 loads at `0x081B9000` (~1.7 MB decompressed). |
+| **Flash-mapped code (region 2)** | `0x10000000`+ | NMI and HardFault handlers. |
+| **Possible DSP / peripheral** | `0x0C480000`, `0x0C490000` | FOTA sections 5–6 target these addresses. Hypothesis: CXD90050 DSP code. |
+
+The ARM Cortex-M4F executes from XIP (execute-in-place) flash at `0x08xxxxxx` and `0x10xxxxxx`. SRAM at `0x04000000` holds stack, data/BSS, and heap.
+
+## 1c. Firmware FOTA Image Format
+
+The v2.5.0 FOTA image (1,395,504 bytes, SHA-256 `ee2a4b60...`) has:
+
+- **Header** (offset 0–0xFFF): SHA-256 checksum + TLV structures describing 7 sections
+- **Encrypted payload** (offset 0x1000, 1,391,408 bytes): LZMA_AES (AES-128-CBC then LZMA decompression)
+
+Key sections from the MOVER_INFO table:
+
+| Section | Source offset | Decompressed size | Destination | Note |
+|---|---|---|---|---|
+| 4 | `0x000DF000` | `0x0019D000` (~1.7 MB) | `0x001B9000` | Main firmware (matches Reset vector) |
+| 5 | — | — | `0x0C480000` | Possibly DSP code |
+| 6 | — | — | `0x0C490000` | Possibly DSP code |
+
+Decryption requires an AES-128-CBC key and IV specific to the WH-1000XM4. Tools: [ramikg/airoha-firmware-parser](https://github.com/ramikg/airoha-firmware-parser), [auracast-research/airoha-fota-mod](https://github.com/auracast-research/airoha-fota-mod). The [HelgeSverre/sony-vp-extract](https://github.com/HelgeSverre/sony-vp-extract) project extracted a similar key from the MT2811 by reading the firmware's FOTA decryption routine via the same RACE READ_ADDRESS (`0x1680`) we have.
+
 ## 2. NVDM store as seen over RACE
 
 `tools/backup_nvdm.py` reads the NVDM through RACE page reads (`0x0403`) with `storage_type = 1` and logical addresses starting at `0`. **Device-verified:**
