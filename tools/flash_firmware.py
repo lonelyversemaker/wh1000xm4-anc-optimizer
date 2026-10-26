@@ -50,6 +50,19 @@ BLOCK_SIZE = 4096
 PAGE_SIZE = 256
 
 
+def parse_partition_info(payload: bytes) -> tuple[int, int, int, int]:
+    """Return (partition ID, storage type, start address, length) from 0x1C00."""
+    if len(payload) < 11 or payload[0] != 0:
+        raise ValueError(f"Invalid FOTA partition response: {payload.hex()}")
+    partition_id = payload[1]
+    storage_type = payload[2]
+    start_address = int.from_bytes(payload[3:7], "little")
+    length = int.from_bytes(payload[7:11], "little")
+    if length == 0 or start_address % BLOCK_SIZE or length % BLOCK_SIZE:
+        raise ValueError(f"Invalid FOTA partition bounds: {payload.hex()}")
+    return partition_id, storage_type, start_address, length
+
+
 def page_crc(data: bytes) -> int:
     crc = 0
     for b in data:
@@ -182,14 +195,9 @@ def flash_firmware(bd_addr: str, fw_path: Path, allow_unknown: bool = False) -> 
             pass
 
         print("Querying partition layout...")
-        # Reply layout: status, partition ID, storage type, u32 address, u32 length (little-endian)
         part_info = race.request(CMD_PARTITION_INFO, bytes([0x00]))
-        if len(part_info) < 11:
-            raise RuntimeError(f"Partition info reply too short: {part_info.hex()}")
-        storage = part_info[2]
-        base = int.from_bytes(part_info[3:7], "little")
-        part_len = int.from_bytes(part_info[7:11], "little")
-        print(f"FOTA partition: id={part_info[1]} storage={storage} address=0x{base:08X} length=0x{part_len:X}")
+        partition_id, storage, base, part_len = parse_partition_info(part_info)
+        print(f"FOTA partition: id={partition_id} storage={storage} address=0x{base:08X} length=0x{part_len:X}")
         if fw_len > part_len:
             raise RuntimeError(f"Firmware ({fw_len} bytes) does not fit the FOTA partition ({part_len} bytes)")
 
@@ -252,9 +260,9 @@ def flash_firmware(bd_addr: str, fw_path: Path, allow_unknown: bool = False) -> 
         elapsed = time.time() - t0
         print(f"\nStaging complete in {elapsed:.1f}s ({fw_len / 1024 / elapsed:.1f} KB/s)!")
 
-        print("Triggering hardware SHA-256 integrity check...")
+        print("Requesting device firmware integrity check...")
         race.request(CMD_CHECK_INTEGRITY, bytes([0x01, 0x00, storage]), timeout=20.0)
-        print("INTEGRITY CHECK PASSED! Signature & SHA-256 verified successfully!")
+        print("Device reported that its firmware integrity check passed.")
 
         race.request(CMD_WRITE_STATE, (0x0211).to_bytes(2, "little"))
 
@@ -264,7 +272,7 @@ def flash_firmware(bd_addr: str, fw_path: Path, allow_unknown: bool = False) -> 
         except (ConnectionResetError, TimeoutError, BrokenPipeError, OSError):
             print("Headphones initiated reboot as expected!")
 
-        print("\nSUCCESS! Firmware successfully installed and rebooted!")
+        print("\nFirmware commit command accepted; verify the version after the headset reconnects.")
         return True
 
     finally:
