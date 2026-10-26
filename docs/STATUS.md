@@ -45,16 +45,51 @@ Last reviewed: 2026-10-26. This file is the single place where claims about the 
 | AES-128-CBC key/IV for WH-1000XM4 FOTA image decryption | Verified offline | The key and IV published by [HelgeSverre/sony-vp-extract](https://github.com/HelgeSverre/sony-vp-extract) also decrypted our SHA-256-identified official v2.5.0 and v3.0.1 FOTA images. Both resulting LZMA streams decompressed, and all 7 / 8 section SHA-256 digests matched the image headers. No live memory dump was needed for these two files. |
 | v2.5.0 versus v3.0.1 firmware sections | Verified offline; ANC effect unknown | The FOTA header contains 7 sections in v2.5.0 and 8 in v3.0.1. The sections targeting `0x00032000` (90,112 bytes) and `0x0C480000` (32,768 bytes) are bit-identical. Other sections differ, and v3.0.1 adds a 3,145,728-byte section targeting `0x0C080000`. These differences do not identify ANC filter changes or quantify acoustic performance. |
 | All 5 official FOTA images downloaded | Verified (SHA-256) | v2.5.0, v2.6.0, v2.7.1, v2.9.0, v3.0.1 from [lzghzr/MDR_Proxy](https://github.com/lzghzr/MDR_Proxy). All LZMA_AES encrypted. |
+| Device firmware dump matches official image | Device-verified | All 7 sections read from the headset via `0x1680` page reads (2,756,608 bytes total, 673 × 4 KiB chunks). Combined SHA-256 matches the decompressed official v2.5.0 image. Files at `~/Desktop/XM4_Firmware_Device_Dump_2.5.0/`. |
+| Ghidra headless decompilation of section 4 (main ARM firmware) | Device-verified (static analysis) | Ghidra 12.2 headless on the 1.69 MB section 4 binary (`0x081B9000` base, ARM:LE:32:Cortex Thumb). Decompiled 7 functions with `optimizer_coeff` cross-references + 5 nearby. See decompile findings below. |
 
-### Inject strategy (hypothesis)
+### Ghidra decompile findings (v2.5.0 section 4)
 
-The RAM READ primitive (`0x1680`) and the firmware's power-off NVDM save behavior suggest an inject path:
+Firmware function call chain for optimizer coefficient handling, from Ghidra decompilation:
 
-1. **Find `optimizer_coeff` RAM address** — either by scanning SRAM for the identity biquad pattern (`0x10000000, 0, 0, 0, 0, 0x10000000, 0, 0, 0, 0`) or by disassembling the decrypted firmware in Ghidra and finding the buffer referenced by the `"Cannot write optimizer coeff to nvdm"` string.
-2. **Write custom coefficients to RAM** — via WRITE_ADDRESS (`0x1681`), if writes to valid SRAM addresses work (untested within confirmed range).
-3. **Firmware saves RAM→NVDM at power off** — the custom values become persistent without touching flash directly.
+| Function | Address | Role | Key detail |
+|---|---|---|---|
+| `FUN_082bb468` | `0x082bb468` | Read `optimizer_coeff` from NVDM | Reads 40 bytes (0x28) from NVDM group `"config"` / item `"optimizer_coeff"`, calls CXD90050 set |
+| `FUN_082bb5d8` | `0x082bb5d8` | Optimizer result → CXD90050 + NVDM save | Gets optimizer struct, byte-swaps 10 words LE→BE, sends to CXD90050, writes to NVDM. This is the power-off save path. |
+| `FUN_082a144c` | `0x082a144c` | `cxd90050_set_nc_optimize_coefficient` | Checks DSP state, calls `FUN_082b02f8` to write to CXD90050 |
+| `FUN_082b02f8` | `0x082b02f8` | `cxd90050_nc_set_nc_optimize_coefficient` | Calls `FUN_082b19a8` for actual coefficient write |
+| `FUN_082b19a8` | `0x082b19a8` | CXD90050 coefficient buffer management | Allocates 40-byte heap buffer at `*(0x10004048 + 0x80)` = `*(0x100040C8)`, stores/compares coefficients, logs values |
+| `FUN_0821a008` | `0x0821a008` | Byte-order converter + CXD90050 set | Converts `param_2` words from LE to BE, calls `FUN_082a144c` |
+| `FUN_08255878` | `0x08255878` | Top-level coefficient apply (boot/optimizer) | Calls `FUN_082bb468` (NVDM read path) or `FUN_082bb4b8` (write path) depending on `param_1` |
 
-**Blockers:** (a) WRITE_ADDRESS not yet verified in valid SRAM, (b) `optimizer_coeff` RAM address unknown, (c) firmware AES key needed for Ghidra disassembly.
+Key RAM addresses from decompilation:
+
+| Address | What | Evidence |
+|---|---|---|
+| `0x10004048` | CXD90050 NC state struct base | Global pointer `DAT_082b1acc`. Live read returned `0x00000013` at offset 0 (state field, not pointer). |
+| `0x100040C8` | Pointer to 40-byte coefficient heap buffer | `*(struct + 0x80)`. Not yet read from live device (headset was off). This is the key address for inject. |
+| `0x100798B4` | `optimizer_is_optimized` flag | Zeroed in `FUN_082bb5d8`. Live read confirmed: `0x00000000`. |
+| `0x100797AC` | CXD90050 state flags | `DAT_082b0360`. Bit 0 at `+4` set after coefficient update. Live read: `0x00B313FF`. |
+
+Byte-swap confirmed in decompile: `FUN_082bb5d8` line 131–132 does `val << 24 | (val >> 8 & 0xFF) << 16 | (val >> 16 & 0xFF) << 8 | val >> 24` — full 32-bit endian swap on each of the 10 words before NVDM write. This confirms NVDM stores big-endian Q4.28, while CXD90050 receives big-endian (the swap happens before both the DSP call and the NVDM write, from the LE optimizer output).
+
+### Inject strategy (updated after Ghidra decompilation)
+
+The decompilation reveals the complete coefficient pipeline. Two inject paths:
+
+**Path A — RAM inject (preferred, needs live device test):**
+
+1. Read `*(0x100040C8)` via `0x1680` to get the heap-allocated 40-byte coefficient buffer address.
+2. Write 10 custom Q4.28 big-endian words to that buffer via `0x1681`.
+3. Power off → `FUN_082bb5d8` saves the buffer to NVDM → persistent.
+4. On next boot → `FUN_082bb468` reads from NVDM → sends to CXD90050 → custom ANC active.
+
+**Path B — Direct CXD90050 DSP write (bypass NVDM):**
+
+1. Call `FUN_082a144c` indirectly by writing coefficients to the buffer and triggering the coefficient-update flag at `0x100797B0` (bit 0).
+2. This applies coefficients to the DSP immediately, without waiting for power cycle.
+
+**Remaining blockers:** (a) WRITE_ADDRESS (`0x1681`) not yet verified in `0x10xxxxxx` RAM range, (b) `*(0x100040C8)` not yet read from live device (headset was off during last test).
 
 ## ANC calibration (`inject`, `verify`, `rollback`)
 
