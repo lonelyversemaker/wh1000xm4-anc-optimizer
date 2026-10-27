@@ -81,6 +81,8 @@ Key RAM addresses from decompilation:
 
 ATCI relay mode limitation (2026-10-27): the relay mode (`0x020C` + `0x0A00`) always returns exactly 3 bytes: `[00][00][XX]` where `XX` is the first character of the AT response text. No additional data follows, even with extended waits. The full AT response (e.g., `DSP1_NCOPT_DATA={...}` from NCOPTGET) is truncated to a single byte. This means we cannot read coefficient values via ATCI — only detect state changes (null vs data-present). The full response text likely goes to UART only.
 
+NCOPTSET handler analysis (2026-10-27): Function at `0x0820F0B0` (`atci_cmd_hdlr_ncopttool`), literal pool at `0x0820F31C`. Firmware strings confirm: NCOPTSET parses `%d,0x%x` (decimal offset, hex value), validates with "Invalid offset or invalid value" error, allocates via `pvPortMallocNC()`, and **sends directly to DSP1** ("Failed to send message to dsp1" error path). This means NCOPTSET writes to the CXD90050 DSP in real-time, not just to a RAM buffer. The earlier wind noise incident (user-reported) is consistent with DSP-direct write of bad coefficients. **Implication for NVDM verification:** NCOPTSET may bypass the RAM buffer at `0x1001A7B8`, so the power-off save (`FUN_082bb5d8`) may NOT capture NCOPTSET values in NVDM. A negative NVDM result does not disprove DSP write.
+
 Byte-swap confirmed in decompile: `FUN_082bb5d8` line 131–132 does `val << 24 | (val >> 8 & 0xFF) << 16 | (val >> 16 & 0xFF) << 8 | val >> 24` — full 32-bit endian swap on each of the 10 words before NVDM write. This confirms NVDM stores big-endian Q4.28, while CXD90050 receives big-endian (the swap happens before both the DSP call and the NVDM write, from the LE optimizer output).
 
 ### Inject strategy (updated after Ghidra decompilation)
