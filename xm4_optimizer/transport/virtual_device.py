@@ -19,9 +19,12 @@ from xm4_optimizer.nvdm.cxd90050 import (
     HowlingDetectionParam,
     HowlingPreventionParam,
     OptimizerCoefficient,
+    OPTIMIZER_COEFF_IDENTITY,
     OptimizerParam,
     OPTIMIZER_COEFF_WORDS,
 )
+from xm4_optimizer.nvdm.item import serialize_item_record
+from xm4_optimizer.nvdm.parser import parse_nvdm_image
 from xm4_optimizer.transport.protocol_mdr import (
     END_MARKER,
     MdrError,
@@ -87,6 +90,8 @@ class VirtualXM4Device:
             "ALIGN_FB_R": [0, 0, 1 << 28, 0, 0] * 5,
         }
         self.ncopt_data: Optional[List[int]] = None
+        self.optimizer_ram_buffer: List[int] = list(OPTIMIZER_COEFF_IDENTITY)
+        self._ncoptset_updates_ram: bool = True
         # Fault Injection Flags
         self.fail_read: bool = False
         self.fail_write: bool = False
@@ -217,6 +222,8 @@ class VirtualXM4Device:
                         self.ncopt_data = [0] * OPTIMIZER_COEFF_WORDS
                     if 0 <= offset < OPTIMIZER_COEFF_WORDS:
                         self.ncopt_data[offset] = value & 0xFFFFFFFF
+                        if self._ncoptset_updates_ram:
+                            self.optimizer_ram_buffer[offset] = value & 0xFFFFFFFF
                     return "\r\nOK\r\n"
                 except Exception:
                     return "\r\nERROR\r\n"
@@ -409,3 +416,75 @@ class VirtualXM4Device:
             self.flash[offset : offset + len(item_bytes)] = item_bytes
             offset += len(item_bytes)
             seq += 1
+        self._next_seq = seq
+
+    def power_cycle(self) -> None:
+        """Emulates firmware power-off save + power-on restore cycle.
+
+        Power-off (FUN_082bb5d8 @ 0x082bb5d8): saves optimizer_ram_buffer to NVDM.
+        Power-on (FUN_082bb468 @ 0x082bb468): reads config/optimizer_coeff from NVDM,
+        restores to both RAM buffer and DSP state.
+
+        Whether NCOPTSET updates the RAM buffer is controlled by _ncoptset_updates_ram,
+        which must be set BEFORE sending NCOPTSET commands (firmware decides at write time,
+        not at power-off time). See docs/STATUS.md NCOPTSET handler analysis.
+        """
+        self.is_connected = False
+
+        # --- Power-off: FUN_082bb5d8 emulation ---
+        # Firmware reads from optimizer_ram_buffer (0x1001A7B8), not from DSP1 state.
+        # If _ncoptset_updates_ram was False, ram buffer was never updated by NCOPTSET.
+        save_words = list(self.optimizer_ram_buffer)
+        coeff = OptimizerCoefficient(words=save_words)
+        val_bytes = coeff.pack()  # big-endian Q4.28, matches firmware byte-swap output
+
+        self._append_nvdm_item("config", "optimizer_coeff", val_bytes)
+
+        # --- Power-on: FUN_082bb468 emulation ---
+        partition = parse_nvdm_image(bytes(self.flash), strict=False)
+        item = partition.get_item("config", "optimizer_coeff")
+        if item is not None and len(item.value) == 40:
+            restored = OptimizerCoefficient.unpack(item.value)
+            self.ncopt_data = list(restored.words)
+            self.optimizer_ram_buffer = list(restored.words)
+        else:
+            self.ncopt_data = None
+            self.optimizer_ram_buffer = list(OPTIMIZER_COEFF_IDENTITY)
+
+        self.is_connected = True
+
+    def _append_nvdm_item(self, group: str, name: str, value: bytes) -> None:
+        """Appends a new NVDM item record to PEB 0 with a higher sequence number."""
+        peb0_end = NVDM_PEB_SIZE
+
+        # Walk item records to find the true end of data in PEB 0.
+        # Each record: 20-byte header + group + name + value + 2-byte checksum, padded to 4.
+        free_offset = 12  # after PEB header
+        while free_offset < peb0_end - 20:
+            status_byte = self.flash[free_offset]
+            if status_byte == 0xFF:
+                break  # empty slot — this is the real free space
+            grp_sz = self.flash[free_offset + 6]
+            name_sz = self.flash[free_offset + 7]
+            val_sz = struct.unpack_from("<H", self.flash, free_offset + 8)[0]
+            record_sz = 20 + grp_sz + name_sz + val_sz + 2
+            record_sz += (-record_sz) % 4  # pad to 4
+            free_offset += record_sz
+
+        self._next_seq += 1
+        record = serialize_item_record(
+            group_name=group,
+            item_name=name,
+            value=value,
+            pnum=0,
+            offset=free_offset,
+            sequence_number=self._next_seq,
+        )
+
+        if free_offset + len(record) > peb0_end:
+            raise OverflowError(
+                f"PEB 0 full: need {len(record)} bytes at offset {free_offset}, "
+                f"but PEB ends at {peb0_end}"
+            )
+
+        self.flash[free_offset : free_offset + len(record)] = record
