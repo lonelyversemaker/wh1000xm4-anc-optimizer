@@ -36,8 +36,8 @@ Last reviewed: 2026-10-26. This file is the single place where claims about the 
 | RACE NVDM write (`0x0E02`) | **Non-functional** | Live test 2026-10-26: tested ~15 different payload formats (1-byte to 16-byte, with/without group+item strings, with/without storage type). All return single-byte `00` RSP. Readback of flash page after write showed value unchanged. The handler appears to be a stub or disabled. |
 | RACE PAGE_PROGRAM (`0x0402`) for all storage types | **Blocked** | Live test 2026-10-26: tested storage_type 0 through 4 at various addresses. All return `rc=0x0A`. Flash writing is completely blocked via RACE on retail firmware. |
 | NVDM is NOT in main NOR flash | Device-verified | Live test 2026-10-26: full 4 MB NOR scan (1024 × 4 KB blocks, `storage_type=0x00`) found zero NVDM blocks (no `NVDM` magic). NVDM uses its own virtual address space (`storage_type=0x01`, starting at `0x00000000`). The physical storage is likely AB1562 internal flash, not the external NOR. |
-| READ_ADDRESS/WRITE_ADDRESS regression | Observed | 2026-10-26: all `0x1680` reads return `rc=3` and value `0xFFFFFFFF` after some point in the session. Earlier in the same session, reads worked correctly (coefficient buffer at `0x1001A7B8` returned valid data, `0x10004048` returned `0x00000013`). Root cause unknown — may be a session state issue or firmware protection that activates after repeated access. |
-| DSP realtime RACE commands (`0x0CD1`–`0x0CD4`) | Device-verified (responsive) | Live test 2026-10-26: these commands return responses (not error/no-reply). Their function is unknown — they may be DSP pass-through commands. Investigation pending. |
+| READ_ADDRESS/WRITE_ADDRESS regression | **Device-verified (persistent, base-only restriction)** | 2026-10-26: reads worked initially; at some point began returning `rc=3` for all non-base addresses. Persists across reconnections AND power cycles. 2026-10-27 systematic test: **only addresses with lower 24 bits = 0 work** (`0x04000000` rc=0, `0x10000000` rc=0, `0x08000000` rc=0, `0x0C000000` rc=0). All others (`0x04000004`, `0x1001A7B8`, `0x10004048`) return `rc=3` with `0000ffff` error payload. Decompile: `rc=3` = `CHECKSUM_ERROR` in protocol code. Root cause likely firmware-level protection triggered by extensive probing; the restriction is to major memory region base addresses only. `0x00000000` returns `rc=255`. |
+| DSP realtime RACE commands (`0x0CD1`–`0x0CD7`) | **Device-verified: NOT audio DSP** | 2026-10-27 analysis: these are BLE/connection management commands, not CXD90050 audio DSP pass-through. They cannot be used to read/write ANC coefficients. |
 | Firmware signature is RSA-2048 checked against eFuses | Unverified | No source. The flasher only shows that the device ran an integrity check (`0x1C01`) and accepted an official image. |
 
 ## Firmware reverse engineering
@@ -67,6 +67,7 @@ Firmware function call chain for optimizer coefficient handling, from Ghidra dec
 | `FUN_082b19a8` | `0x082b19a8` | CXD90050 coefficient buffer management | Allocates 40-byte heap buffer at `*(0x10004048 + 0x80)` = `*(0x100040C8)`, stores/compares coefficients, logs values |
 | `FUN_0821a008` | `0x0821a008` | Byte-order converter + CXD90050 set | Converts `param_2` words from LE to BE, calls `FUN_082a144c` |
 | `FUN_08255878` | `0x08255878` | Top-level coefficient apply (boot/optimizer) | Calls `FUN_082bb468` (NVDM read path) or `FUN_082bb4b8` (write path) depending on `param_1` |
+| `FUN_0822a518` | `0x0822a518` | Address-based read router | Routes by bits 26-27: `(addr & 0x0C000000) == 0x0C000000` → SPI flash via `FUN_0822abb0`, else → MCU memory via `FUN_081bd0f0(addr & 0xf7ffffff)`. Dispatch table at `0x08304BB4` points to handler at `0x0822A8A5` (Thumb). |
 
 Key RAM addresses from decompilation:
 
@@ -77,6 +78,8 @@ Key RAM addresses from decompilation:
 | `0x1001A7B8` | Live coefficient buffer (40 bytes, heap) | **Device-verified**. Contains 2 × 5 Q4.28 biquad coefficients in big-endian. READ_ADDRESS returns LE words, so `0x10000000` BE reads as `0x00000010` LE. WRITE_ADDRESS verified: wrote test pattern, readback matched, original restored. **This is the inject target.** |
 | `0x100798B4` | `optimizer_is_optimized` flag | Zeroed in `FUN_082bb5d8`. Live read confirmed: `0x00000000`. |
 | `0x100797AC` | CXD90050 state flags | `DAT_082b0360`. Bit 0 at `+4` set after coefficient update. Live read: `0x00B313FF`. |
+
+ATCI relay mode limitation (2026-10-27): the relay mode (`0x020C` + `0x0A00`) always returns exactly 3 bytes: `[00][00][XX]` where `XX` is the first character of the AT response text. No additional data follows, even with extended waits. The full AT response (e.g., `DSP1_NCOPT_DATA={...}` from NCOPTGET) is truncated to a single byte. This means we cannot read coefficient values via ATCI — only detect state changes (null vs data-present). The full response text likely goes to UART only.
 
 Byte-swap confirmed in decompile: `FUN_082bb5d8` line 131–132 does `val << 24 | (val >> 8 & 0xFF) << 16 | (val >> 16 & 0xFF) << 8 | val >> 24` — full 32-bit endian swap on each of the 10 words before NVDM write. This confirms NVDM stores big-endian Q4.28, while CXD90050 receives big-endian (the swap happens before both the DSP call and the NVDM write, from the LE optimizer output).
 
@@ -108,15 +111,15 @@ The decompilation reveals the complete coefficient pipeline. Two inject paths:
 | RACE NVDM write (`0x0E02`) | **FAILED** | Returns `00` for all payload formats, but does not actually write. Flash readback unchanged. |
 | RACE PAGE_PROGRAM (`0x0402`) | **FAILED** | Returns `rc=0x0A` for storage types 0–4. Flash writing completely blocked. |
 | Physical NOR flash write | **N/A** | NVDM is not in external NOR — it's in AB1562 internal flash. |
-| ATCI COEFSET via relay mode | **Accepted, unverified** | `AT+HWPTOOL=COEFSET,<hex>` returns `00 00 54` ('T'=accepted) after enabling relay via `0x020C`. Cannot verify DSP effect because (a) response is truncated to 3 bytes, (b) READ_ADDRESS regression prevents reading coefficient buffer, (c) no listening test done. |
-| ATCI NCOPTSET via relay mode | **Accepted, unverified** | Same status as COEFSET. |
+| ATCI COEFSET via relay mode | **Accepted (correct format), DSP effect unverified** | `AT+HWPTOOL=COEFSET,<filter>,<stage>,<b0>,...,<a2>` returns `0x54` for all 20 filter×stage combos. Previous hex-blob format was wrong. |
+| ATCI NCOPTSET via relay mode | **Accepted + RAM write confirmed, NVDM pending power cycle** | `AT+NCOPTTOOL=NCOPTSET,<offset>,0x<value>` accepted for all offsets/values. NCOPTGET state change confirms RAM write. NVDM verification needs power cycle (script ready: `tools/post_cycle_verify.py`). |
 | RAM WRITE_ADDRESS (`0x1681`) | **Verified writes, but DSP pickup unknown** | Can write to coefficient buffer at `0x1001A7B8`. Whether the DSP reads from this buffer in real time or only at specific events (NC toggle, power cycle) is unknown. READ_ADDRESS regression prevents verification. |
-| DSP realtime (`0x0CD1`–`0x0CD4`) | **Unexplored** | These commands respond; their payload format and function are unknown. |
+| DSP realtime (`0x0CD1`–`0x0CD7`) | **Not viable** | Analyzed: BLE/connection management, not audio DSP. |
 
-**Next steps to resolve:**
-1. **Listening test with ATCI COEFSET** — send identity-passthrough coefficients (`b0=1, rest=0`) via relay mode → COEFSET, then check if ANC behavior changes audibly.
-2. **Investigate DSP realtime commands** — probe `0x0CD1`–`0x0CD4` with varying payloads to determine if they can read/write DSP state.
-3. **Fresh connection for READ_ADDRESS** — reconnect to clear the `rc=3` regression and verify coefficient buffer state after COEFSET.
+**Next steps to resolve (2026-10-27):**
+1. **Power cycle NVDM verification** — NCOPTSET markers sent, user must power cycle headphones, then run `python3 tools/post_cycle_verify.py`. If DEAD markers appear in NVDM → pipeline fully proven.
+2. **If markers NOT in NVDM** — investigate offset semantics (byte vs word, buffer vs struct index), try HWPTOOL COEFSET path instead.
+3. **After write path proven** — send actual custom biquad coefficients, power cycle, verify via NVDM readback + optional listening test.
 
 ## ANC calibration (`inject`, `verify`, `rollback`)
 
@@ -133,7 +136,10 @@ The decompilation reveals the complete coefficient pipeline. Two inject paths:
 | "+6.5 to +7.5 dB extra low-frequency noise reduction" | Code/simulation | This is the simulated magnitude response of the synthesized filter. It is not an ANC measurement. Real noise reduction depends on the acoustic paths, which were never measured. |
 | A bad NVDM checksum cannot bootloop the headset (ROM fallback) | Unverified | No source or test. |
 | Rollback restores the dump "bit-exact" | Unverified | The rollback path only issues page-program commands. NOR flash cannot turn 0 bits back into 1 without an erase, and the emulator in `virtual_device.py` hides this. |
-| `AT+HWPTOOL=COEFSET` / `AT+ENVDM` ATCI commands | **Dead on v2.5.0 via 0x0F92; partially alive via relay mode** | `0x0F92` produces no response on retail v2.5.0. However, RACE relay mode (`0x020C`) enables ATCI via `0x0A00`: AT commands return 3-byte RSP `00 00 XX` where XX is `07` (basic AT), `4F` ('O', dump commands), or `54` ('T', SET commands). Full AT response text is NOT returned — only the 3-byte status. COEFSET and NCOPTSET return `00 00 54` (accepted), but the DSP effect is unverified (no listening test done). The truncated response may mean the AT text goes to UART, not BT. |
+| `AT+HWPTOOL=COEFSET` / `AT+ENVDM` ATCI commands | **Dead on v2.5.0 via 0x0F92; alive via relay mode with correct format** | `0x0F92` produces no response on retail v2.5.0. RACE relay mode (`0x020C`) enables ATCI via `0x0A00`. **Critical format discovery from firmware binary strings (v2.5.0):** previous sessions sent raw hex blobs (`AT+HWPTOOL=COEFSET,<40-byte-hex>`) which was WRONG. Correct formats: `AT+NCOPTTOOL=NCOPTSET,<offset>,0x<value>` (decimal offset, hex value; fw string at `0x082F4B26`: `%d,0x%x`), `AT+NCOPTTOOL=NCOPTGET` → `DSP1_NCOPT_DATA={...}`, `AT+NCOPTTOOL=NCOPTDUMP` → `DSP1_NCOPT_ALL_DATA={...}`, `AT+HWPTOOL=COEFSET,<filter_id>,<stage_idx>,<b0>,<b1>,<b2>,<a1>,<a2>` (fw string at `0x082F3F60`: `iir_coef[%d][%d]`). |
+| NCOPTSET with correct format | **Device-verified: accepted, RAM state change confirmed** | 2026-10-27: `AT+NCOPTTOOL=NCOPTSET,<offset>,0x<value>` returns `0x54` ('T') or `0x4F` ('O') for ALL offsets tested (0–49, negatives, up to 1000). All values accepted (identity, markers, zero, max). Offsets 5 and 13 sometimes return `0x00` instead. **Key proof: NCOPTGET returns `0x00` (null/no data) BEFORE NCOPTSET, changes to `0x54` ('T'/data present) AFTER NCOPTSET.** This state change proves NCOPTSET modifies firmware internal state. NVDM unchanged immediately after NCOPTSET — consistent with Ghidra finding that NCOPTSET writes to RAM buffer, not NVDM. Power cycle needed to trigger `FUN_082bb5d8` (RAM → NVDM save). |
+| HWPTOOL COEFSET with correct format | **Device-verified: accepted** | 2026-10-27: `AT+HWPTOOL=COEFSET,<filter>,<stage>,<b0>,<b1>,<b2>,<a1>,<a2>` returns `0x54` for all 20 combinations (4 filters × 5 stages). |
+| ENVDM read/write via ATCI | **Mixed** | 2026-10-27: `AT+ENVDM=R,config,optimizer_coeff` returns `0x54` or `0x00` depending on session state. `AT+ENVDM=W,...` with data returns `0x4F`/`0x87`, flash unchanged. |
 
 Code facts about the old write paths (confirmed by reading the code after a user report, 2026-10-26):
 
