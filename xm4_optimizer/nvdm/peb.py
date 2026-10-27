@@ -12,8 +12,9 @@ import struct
 from typing import Optional
 
 PEB_SIZE: int = 4096
-TOTAL_PEBS: int = 32
-NVDM_PARTITION_SIZE: int = PEB_SIZE * TOTAL_PEBS  # 131,072 bytes (128 KB)
+TOTAL_PEBS: int = 128
+NVDM_PARTITION_SIZE: int = PEB_SIZE * TOTAL_PEBS  # 524,288 bytes (512 KB)
+LEGACY_PARTITION_SIZE: int = PEB_SIZE * 32  # 131,072 bytes (128 KB) — mock/emulator compat
 NVDM_BASE_ADDRESS: int = 0x000DF000
 PEB_MAGIC: int = 0x4D44564E  # "NVDM" in ASCII little-endian
 PEB_HEADER_SIZE: int = 12

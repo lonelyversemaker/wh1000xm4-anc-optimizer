@@ -399,3 +399,15 @@ def synthesize_anc_filter(
         gain_db=target_gain_db,
     )
     return block, res
+
+
+def synthesize_optimizer_coeff(
+    target_gain_db: float = DEFAULT_BOOST_GAIN_DB,
+    fs: float = float(DEFAULT_SAMPLE_RATE),
+) -> Tuple["OptimizerCoefficient", SynthesisResult]:
+    """Synthesizes a 40-byte OptimizerCoefficient (2 biquads) for config/optimizer_coeff."""
+    from xm4_optimizer.nvdm.cxd90050 import OptimizerCoefficient
+
+    block, res = synthesize_anc_filter(target_gain_db=target_gain_db, fs=fs, filter_id=0)
+    coeff = OptimizerCoefficient.from_biquads(block.biquads[:2])
+    return coeff, res

@@ -376,8 +376,8 @@ class TestRfcommTransport:
 
         image = read_nvdm_partition(device, progress_callback=on_progress)
         assert len(image) == NVDM_PARTITION_SIZE
-        assert len(progress_calls) == 512
-        assert progress_calls[-1] == (512, 512)
+        assert len(progress_calls) == 2048
+        assert progress_calls[-1] == (2048, 2048)
 
         # Offset 0 is PEB magic 0x4D44564E
         magic = struct.unpack("<I", image[:4])[0]

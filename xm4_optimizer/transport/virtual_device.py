@@ -1,8 +1,8 @@
 """Virtual XM4 Mock Device Transport and Flash Emulator.
 
 Provides an in-memory simulation of the Sony WH-1000XM4 Bluetooth RFCOMM
-subsystem (Channel 11 MDR and Channel 21 RACE/ATCI), 128KB NOR Flash Partition 6,
-and CXD90050 DSP registers.
+subsystem (Channel 11 MDR and Channel 21 RACE/ATCI), NVDM flash partition,
+CXD90050 DSP registers, and NCOPTSET/NCOPTGET commands.
 """
 
 from __future__ import annotations
@@ -18,7 +18,9 @@ from xm4_optimizer.nvdm.cxd90050 import (
     FILTER_ID_ALIGN_FF_R,
     HowlingDetectionParam,
     HowlingPreventionParam,
+    OptimizerCoefficient,
     OptimizerParam,
+    OPTIMIZER_COEFF_WORDS,
 )
 from xm4_optimizer.transport.protocol_mdr import (
     END_MARKER,
@@ -39,10 +41,10 @@ from xm4_optimizer.transport.protocol_race import (
 
 # Flash Geometry Constants
 NVDM_BASE_ADDR: int = 0x000DF000
-NVDM_PARTITION_SIZE: int = 128 * 1024  # 131,072 bytes (128 KB)
+NVDM_PARTITION_SIZE: int = 512 * 1024  # 524,288 bytes (512 KB)
 NVDM_PAGE_SIZE: int = 256
 NVDM_PEB_SIZE: int = 4096
-NVDM_PEB_COUNT: int = 32
+NVDM_PEB_COUNT: int = 128
 
 PEB_MAGIC_NVDM: int = 0x4D44564E  # "NVDM" in ASCII LE
 PEB_STATUS_ACTIVED: int = 0xE0
@@ -84,6 +86,7 @@ class VirtualXM4Device:
             "ALIGN_FB_L": [0, 0, 1 << 28, 0, 0] * 5,
             "ALIGN_FB_R": [0, 0, 1 << 28, 0, 0] * 5,
         }
+        self.ncopt_data: Optional[List[int]] = None
         # Fault Injection Flags
         self.fail_read: bool = False
         self.fail_write: bool = False
@@ -203,6 +206,32 @@ class VirtualXM4Device:
                     return f"\r\n+HWPTOOL: COEFGET,{target_idx},{stage_idx},{coeff_str}\r\n\r\nOK\r\n"
                 except Exception:
                     return "\r\nERROR\r\n"
+
+        if cmd.startswith("AT+NCOPTTOOL=NCOPTSET"):
+            parts = cmd.split(",")
+            if len(parts) >= 3:
+                try:
+                    offset = int(parts[1])
+                    value = int(parts[2], 16) if parts[2].startswith("0x") else int(parts[2])
+                    if self.ncopt_data is None:
+                        self.ncopt_data = [0] * OPTIMIZER_COEFF_WORDS
+                    if 0 <= offset < OPTIMIZER_COEFF_WORDS:
+                        self.ncopt_data[offset] = value & 0xFFFFFFFF
+                    return "\r\nOK\r\n"
+                except Exception:
+                    return "\r\nERROR\r\n"
+            return "\r\nERROR\r\n"
+
+        if cmd.startswith("AT+NCOPTTOOL=NCOPTGET"):
+            if self.ncopt_data is not None:
+                return "\r\n+NCOPTTOOL: DSP1_NCOPT_DATA=T\r\n\r\nOK\r\n"
+            return "\r\n+NCOPTTOOL: DSP1_NCOPT_DATA=\r\n\r\nOK\r\n"
+
+        if cmd.startswith("AT+NCOPTTOOL=NCOPTDUMP"):
+            if self.ncopt_data is not None:
+                vals = ",".join(f"0x{w:08X}" for w in self.ncopt_data)
+                return f"\r\n+NCOPTTOOL: DSP1_NCOPT_ALL_DATA={vals}\r\n\r\nOK\r\n"
+            return "\r\n+NCOPTTOOL: DSP1_NCOPT_ALL_DATA=\r\n\r\nOK\r\n"
 
         if cmd.startswith("AT+ENVDM=W"):
             return "\r\n+ENVDM: W,OK\r\n\r\nOK\r\n"
@@ -350,6 +379,7 @@ class VirtualXM4Device:
             ("DNC", "HOWLING_PRE_PARAM", HowlingPreventionParam().pack()),
             ("DNC", "HOWLING_DET_PARAM", HowlingDetectionParam().pack()),
             ("DNC", "OPTIMIZER_PARAM", OptimizerParam().pack()),
+            ("config", "optimizer_coeff", OptimizerCoefficient().pack()),
         ]
 
         for grp, name, val in items_to_seed:

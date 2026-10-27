@@ -312,7 +312,7 @@ class TestVirtualXM4DeviceStressAndFaults:
     """Stress tests, partition boundaries, and fault injection for VirtualXM4Device."""
 
     def test_virtual_device_flash_boundary_limits(self) -> None:
-        """Verifies strict adherence to Partition 6 boundaries (0x000DF000 to 0x000FF000)."""
+        """Verifies strict adherence to Partition 6 boundaries (0x000DF000 to 0x0015F000)."""
         device = VirtualXM4Device()
         device.connect()
 
@@ -421,7 +421,7 @@ class TestVirtualXM4DeviceStressAndFaults:
         device = VirtualXM4Device()
         device.connect()
 
-        bad_addr = 0x000FF000  # Partition boundary is 0x000FF000
+        bad_addr = 0x0015F000  # Partition boundary is 0x000DF000 + 0x80000 = 0x0015F000
         data = b"\x00" * FLASH_PAGE_SIZE
         crc = compute_fota_checksum(data)
         payload = struct.pack("<BBBI", 0, 1, crc, bad_addr) + data

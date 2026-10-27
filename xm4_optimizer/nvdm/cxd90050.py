@@ -95,6 +95,89 @@ def deserialize_alignment_block(data: bytes) -> CXD90050AlignmentBlock:
     return CXD90050AlignmentBlock.unpack(data)
 
 
+OPTIMIZER_COEFF_SIZE: int = 40
+OPTIMIZER_COEFF_WORDS: int = 10
+OPTIMIZER_COEFF_GROUP: str = "config"
+OPTIMIZER_COEFF_ITEM: str = "optimizer_coeff"
+OPTIMIZER_COEFF_BIQUADS: int = 2
+
+OPTIMIZER_COEFF_IDENTITY: list[int] = [
+    0x10000000, 0, 0, 0, 0,
+    0x10000000, 0, 0, 0, 0,
+]
+
+
+@dataclass
+class OptimizerCoefficient:
+    """40-byte NC Optimizer coefficient block as stored in NVDM config/optimizer_coeff.
+
+    Layout: 2 biquads × 5 big-endian Q4.28 words.
+    Word order per biquad: b0, b1, b2, a1, a2.
+    Identity: b0 = 0x10000000 (1.0), rest zero.
+    """
+
+    words: list[int] = None  # type: ignore[assignment]
+
+    def __post_init__(self) -> None:
+        if self.words is None:
+            self.words = list(OPTIMIZER_COEFF_IDENTITY)
+        if len(self.words) != OPTIMIZER_COEFF_WORDS:
+            raise ValueError(
+                f"OptimizerCoefficient needs {OPTIMIZER_COEFF_WORDS} words, got {len(self.words)}"
+            )
+
+    def pack(self) -> bytes:
+        return struct.pack(f">{OPTIMIZER_COEFF_WORDS}I", *self.words)
+
+    @classmethod
+    def unpack(cls, data: bytes) -> OptimizerCoefficient:
+        if len(data) != OPTIMIZER_COEFF_SIZE:
+            raise ValueError(
+                f"OptimizerCoefficient must be {OPTIMIZER_COEFF_SIZE} bytes, got {len(data)}"
+            )
+        words = list(struct.unpack(f">{OPTIMIZER_COEFF_WORDS}I", data))
+        return cls(words=words)
+
+    @classmethod
+    def from_biquads(cls, biquads: list[BiquadCoefficients]) -> OptimizerCoefficient:
+        """Converts up to 2 BiquadCoefficients into the firmware word layout (b0,b1,b2,a1,a2 per biquad)."""
+        words: list[int] = []
+        for i in range(OPTIMIZER_COEFF_BIQUADS):
+            if i < len(biquads):
+                bq = biquads[i]
+                q28 = bq.to_q28_tuple()  # (a1, a2, b0, b1, b2)
+                words.extend([q28[2] & 0xFFFFFFFF, q28[3] & 0xFFFFFFFF, q28[4] & 0xFFFFFFFF,
+                              q28[0] & 0xFFFFFFFF, q28[1] & 0xFFFFFFFF])
+            else:
+                words.extend([0x10000000, 0, 0, 0, 0])
+        return cls(words=words)
+
+    def to_biquads(self) -> list[BiquadCoefficients]:
+        """Converts firmware words back to BiquadCoefficients (b0,b1,b2,a1,a2 → standard order)."""
+        def _to_signed(w: int) -> int:
+            return w if w < 0x80000000 else w - 0x100000000
+
+        biquads = []
+        for i in range(OPTIMIZER_COEFF_BIQUADS):
+            base = i * 5
+            b0, b1, b2, a1, a2 = [_to_signed(w) for w in self.words[base:base + 5]]
+            biquads.append(BiquadCoefficients.from_q28_tuple(
+                (a1, a2, b0, b1, b2),
+            ))
+        return biquads
+
+    def to_ncoptset_commands(self) -> list[str]:
+        """Returns the AT+NCOPTTOOL=NCOPTSET commands for each word offset."""
+        return [
+            f"AT+NCOPTTOOL=NCOPTSET,{i},0x{self.words[i]:08X}"
+            for i in range(OPTIMIZER_COEFF_WORDS)
+        ]
+
+    @property
+    def is_identity(self) -> bool:
+        return self.words == OPTIMIZER_COEFF_IDENTITY
+
+
 @dataclass
 class HowlingPreventionParam:
     """32-byte DNC Howling Prevention Control Parameter Block (HOWLING_PRE_PARAM).

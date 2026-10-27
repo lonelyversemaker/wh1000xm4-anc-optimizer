@@ -14,6 +14,7 @@ from xm4_optimizer.dsp import (
 from xm4_optimizer.nvdm import (
     CXD90050AlignmentBlock,
     NvdmPartition,
+    OptimizerCoefficient,
     extract_cxd90050_blocks,
     parse_nvdm_image,
 )
@@ -37,6 +38,7 @@ __all__ = [
     "CXD90050AlignmentBlock",
     "DeviceTransport",
     "NvdmPartition",
+    "OptimizerCoefficient",
     "SynthesisResult",
     "VirtualXM4Device",
     "__version__",

@@ -9,9 +9,9 @@ Unofficial CLI for the Sony WH-1000XM4. Evidence levels for each feature: docs/S
    - `xm4-optimizer parse [input.bin]`        : Parse 512KB/128KB NVDM calibration dump and CXD90050 items
    - `xm4-optimizer optimize --target-gain 7.5`: Synthesize low-hiss Q4.28 ANC Biquad IIR filter
    - `xm4-optimizer dry-run --target-gain 7.5` : Zero-byte simulation barrier (writes 0 bytes)
-   - `xm4-optimizer inject --target-gain 7.5`  : Emulator only (--mock); disabled on hardware, model contradicted by a real dump
-   - `xm4-optimizer verify --target-gain 7.5`  : Emulator only; readback check for the injector model
-   - `xm4-optimizer rollback <backup.bin>`     : Emulator only (--mock); disabled on hardware
+   - `xm4-optimizer inject --target-gain 7.5`  : Send coefficients via NCOPTSET; disabled on hardware until power-cycle verification
+   - `xm4-optimizer verify --target-gain 7.5`  : NCOPTGET state check
+   - `xm4-optimizer rollback <backup.bin>`     : Reset to identity via NCOPTSET
    - `xm4-optimizer status`                    : Display Bluetooth connection, battery, and firmware status
 
 2. Top-level flag workflows (backwards-compatible with tests):
@@ -43,14 +43,15 @@ if str(REPO_ROOT) not in sys.path:
 from tools.backup_nvdm import backup_xm4_nvdm, find_connected_xm4_mac
 from tools.flash_firmware import flash_firmware
 
-from xm4_optimizer.dsp.synthesizer import synthesize_anc_filter
+from xm4_optimizer.dsp.synthesizer import synthesize_optimizer_coeff
 from xm4_optimizer.nvdm.cxd90050 import (
-    CXD90050AlignmentBlock,
-    FILTER_ID_ALIGN_FF_L,
-    FILTER_ID_TO_NAME,
+    OptimizerCoefficient,
+    OPTIMIZER_COEFF_GROUP,
+    OPTIMIZER_COEFF_ITEM,
 )
-from xm4_optimizer.nvdm.parser import extract_cxd90050_blocks, parse_nvdm_image
+from xm4_optimizer.nvdm.parser import parse_nvdm_image
 from xm4_optimizer.safety.dry_run import (
+    DryRunItemNotFoundError,
     ReadOnlyTransportGuard,
     execute_dry_run,
 )
@@ -66,8 +67,7 @@ from xm4_optimizer.safety.rollback import (
 )
 from xm4_optimizer.safety.verifier import (
     VerificationError,
-    verify_dsp_registers_atci,
-    verify_nvdm_block_in_flash,
+    verify_ncoptget_state,
 )
 from xm4_optimizer.transport.rfcomm_socket import (
     BluetoothRfcommTransport,
@@ -111,7 +111,6 @@ def _create_transport(
         dev.connect()
         return dev
 
-    # Real hardware mode: Auto-detect MAC if not provided
     effective_mac = _resolve_target_mac(mac)
     if not effective_mac:
         raise ConnectionError(
@@ -129,10 +128,9 @@ def _run_dry_run_workflow(
     transport: DeviceTransport,
     target_gain: float,
     sample_rate: float,
-    filter_id: int,
     image_path: Optional[Path] = None,
 ) -> int:
-    """Executes zero-byte dry-run workflow and prints diff tables + ASCII response curve."""
+    """Executes zero-byte dry-run workflow and prints coefficient diff + ASCII response curve."""
     guard = ReadOnlyTransportGuard(transport)
     if image_path is not None and image_path.exists():
         orig_image = image_path.read_bytes()
@@ -141,20 +139,13 @@ def _run_dry_run_workflow(
             guard, base_addr=NVDM_PARTITION_BASE, size=NVDM_PARTITION_SIZE
         )
 
-    blocks = extract_cxd90050_blocks(orig_image)
-    filter_name = FILTER_ID_TO_NAME.get(filter_id, "ALIGN_FF_L")
-    base_block = blocks.get(filter_name, CXD90050AlignmentBlock(filter_id=filter_id))
-
-    opt_block, syn_res = synthesize_anc_filter(
-        target_gain_db=target_gain,
-        fs=sample_rate,
-        filter_id=filter_id,
-        base_block=base_block,
+    opt_coeff, syn_res = synthesize_optimizer_coeff(
+        target_gain_db=target_gain, fs=sample_rate,
     )
 
     rc = execute_dry_run(
         original_image=orig_image,
-        optimized_block=opt_block,
+        optimized_coeff=opt_coeff,
         synthesis_result=syn_res,
         transport=guard,
         print_output=True,
@@ -189,7 +180,6 @@ def _run_parse_workflow(
         )
 
     partition = parse_nvdm_image(img, strict=False)
-    blocks = extract_cxd90050_blocks(partition)
 
     print("=" * 80)
     print(f"  Parsed NVDM Calibration Items ({len(partition.pebs)} PEBs, {len(partition.active_items)} unique active items)")
@@ -203,8 +193,17 @@ def _run_parse_workflow(
             f"Seq {item.header.sequence_number:6d}"
         )
     print("=" * 80)
-    if blocks:
-        print(f"Extracted CXD90050 / DNC Blocks: {', '.join(blocks.keys())}")
+
+    coeff_item = partition.get_item(OPTIMIZER_COEFF_GROUP, OPTIMIZER_COEFF_ITEM)
+    if coeff_item is not None and len(coeff_item.value) == 40:
+        coeff = OptimizerCoefficient.unpack(coeff_item.value)
+        labels = ["L:b0", "L:b1", "L:b2", "L:a1", "L:a2",
+                  "R:b0", "R:b1", "R:b2", "R:a1", "R:a2"]
+        print(f"\n  config/optimizer_coeff ({'identity' if coeff.is_identity else 'custom'}):")
+        for i, w in enumerate(coeff.words):
+            lbl = labels[i] if i < len(labels) else f"[{i}]"
+            print(f"    [{i}] {lbl:5s} = 0x{w:08X}")
+
     return 0
 
 
@@ -212,65 +211,50 @@ def _run_inject_workflow(
     transport: DeviceTransport,
     target_gain: float,
     sample_rate: float,
-    filter_id: int,
     backup_out: Optional[Path] = None,
 ) -> int:
-    """Synthesizes and safely injects ANC filter parameters with automatic backup & verification."""
+    """Synthesizes and sends ANC coefficients via NCOPTSET."""
     if backup_out is not None:
         create_nvdm_backup(transport, backup_out)
 
-    orig_image = read_nvdm_partition(
-        transport, base_addr=NVDM_PARTITION_BASE, size=NVDM_PARTITION_SIZE
-    )
-    blocks = extract_cxd90050_blocks(orig_image)
-    filter_name = FILTER_ID_TO_NAME.get(filter_id, "ALIGN_FF_L")
-    base_block = blocks.get(filter_name, CXD90050AlignmentBlock(filter_id=filter_id))
-
-    opt_block, syn_res = synthesize_anc_filter(
-        target_gain_db=target_gain,
-        fs=sample_rate,
-        filter_id=filter_id,
-        base_block=base_block,
+    opt_coeff, syn_res = synthesize_optimizer_coeff(
+        target_gain_db=target_gain, fs=sample_rate,
     )
 
-    ok = execute_injection(
+    result = execute_injection(
         transport=transport,
-        optimized_block=opt_block,
-        backup_image=orig_image,
-        auto_rollback_on_failure=True,
+        optimized_coeff=opt_coeff,
+        verify=True,
     )
-    if not ok:
-        print("ERROR: Injection failed. Automatic rollback completed.")
+    if not result.success:
+        print("ERROR: Injection failed.")
         return 1
 
-    print("INJECTION & BIT-EXACT VERIFICATION SUCCEEDED")
+    status = "NCOPTGET confirmed" if result.ncoptget_confirmed else "sent (NCOPTGET not confirmed)"
+    print(f"INJECTION SUCCEEDED: {result.words_sent} words sent via NCOPTSET ({status})")
+    print("NOTE: Coefficients are in DSP RAM. Power off headphones to save to NVDM.")
     return 0
 
 
 def _run_verify_workflow(
     transport: DeviceTransport,
-    target_gain: float,
-    sample_rate: float,
-    filter_id: int,
 ) -> int:
-    """Verifies that flash and DSP registers match the synthesized filter block."""
-    opt_block, _ = synthesize_anc_filter(
-        target_gain_db=target_gain,
-        fs=sample_rate,
-        filter_id=filter_id,
-    )
-    verify_nvdm_block_in_flash(transport, expected_block=opt_block)
-    verify_dsp_registers_atci(transport, expected_block=opt_block)
-    print("READBACK VERIFICATION PASSED (100% BIT-EXACT)")
-    return 0
+    """Verifies that NCOPTGET reports data-present."""
+    has_data = verify_ncoptget_state(transport)
+    if has_data:
+        print("NCOPTGET: DSP has coefficient data (state confirmed)")
+        return 0
+    print("NCOPTGET: DSP reports no coefficient data")
+    return 1
 
 
 def _run_rollback_workflow(transport: DeviceTransport, backup_path: Path) -> int:
-    """Restores a NVDM backup image bit-for-bit."""
+    """Resets optimizer coefficients to identity via NCOPTSET."""
     ok = execute_rollback(transport, backup_path, verify=True)
     if ok:
         print(
-            f"ROLLBACK SUCCEEDED: Restored NVDM partition from {backup_path} (100% bit-exact)"
+            f"ROLLBACK SUCCEEDED: Identity coefficients sent via NCOPTSET.\n"
+            f"NOTE: Power off headphones to save to NVDM."
         )
         return 0
     return 1
@@ -308,7 +292,6 @@ def _run_anc_workflow(mac: str, mode: str, level: Optional[int] = None, voice: b
             if target_mode is AncMode.AMBIENT:
                 target = AmbientSoundState(target_mode, voice, current.ambient_level if level is None else level)
             else:
-                # The headset keeps its focus-on-voice flag outside ambient mode; resend the current one.
                 target = AmbientSoundState(target_mode, current.focus_on_voice, current.ambient_level)
             result = client.set_ambient_sound(target)
             print(f"ANC mode: {_format_ambient(result)}")
@@ -391,7 +374,6 @@ def _run_status_workflow(mac: Optional[str]) -> int:
     effective_mac = _resolve_target_mac(mac)
     print(f"  Connected Headset MAC : {effective_mac or 'Not detected (Disconnected)'}")
 
-    # Bluetooth status
     try:
         bt_out = subprocess.check_output(["bluetoothctl", "info", effective_mac or ""], text=True) if effective_mac else ""
         connected = "Connected: yes" in bt_out
@@ -410,7 +392,6 @@ def _run_status_workflow(mac: Optional[str]) -> int:
         except (OSError, SonyControlError) as e:
             print(f"  Headset Query         : failed ({e})")
 
-    # Spatial audio status (experimental)
     try:
         pw_out = subprocess.check_output(["pw-link", "-l"], text=True, stderr=subprocess.DEVNULL)
         spatial_active = "aerospatial_3d_sink" in pw_out
@@ -435,11 +416,12 @@ ARCHITECTURAL DISTINCTION: FLASHER vs. INJECTOR
      images only and compare their hash first (see README). Device-verified once: v3.0.1 -> v2.5.0.
    - Headset reboots automatically on commit.
 
-2. `xm4-optimizer inject --target-gain <dB>` (Calibration Parameter Injector):
-   - Status: DISABLED on real hardware. It targets a 108-byte DNC/ALIGN_* biquad item that does not
-     exist on a real WH-1000XM4 (there ALIGN_* are 8-byte values under group CXD90050).
-   - Runs against the in-memory emulator with --mock. --allow-unverified-write overrides the block.
-   - Page writes without erase cannot restore 0 -> 1 bits; rollback is not proven. See docs/STATUS.md.
+2. `xm4-optimizer inject --target-gain <dB>` (NC Optimizer Coefficient Injector):
+   - Targets config/optimizer_coeff (40 bytes, 2x5 Q4.28 big-endian words) via NCOPTSET.
+   - NCOPTSET sends coefficients directly to CXD90050 DSP1 in real time.
+   - No flash writes — the firmware saves to NVDM on headphone power-off (FUN_082bb5d8).
+   - NCOPTSET verified on device 2026-10-27; power-cycle NVDM persistence pending.
+   - Disabled on real hardware until --allow-unverified-write is given. See docs/STATUS.md.
 ====================================================================================================
 """
     parser = argparse.ArgumentParser(
@@ -455,22 +437,21 @@ ARCHITECTURAL DISTINCTION: FLASHER vs. INJECTOR
     parser.add_argument("--backup", dest="flag_backup", type=Path, default=None, help="Backup NVDM calibration image to path.")
     parser.add_argument("--parse", dest="flag_parse", action="store_true", help="Parse and display NVDM calibration items and checksums.")
     parser.add_argument("--optimize", dest="flag_optimize", action="store_true", help="Synthesize optimal Biquad IIR ANC filter coefficients.")
-    parser.add_argument("--inject", dest="flag_inject", action="store_true", help="[INJECTOR, emulator only] Inject the synthesized filter into the emulated 108B NVDM model.")
-    parser.add_argument("--verify", dest="flag_verify", action="store_true", help="Verify bit-exact flash and DSP register readback.")
-    parser.add_argument("--rollback", dest="flag_rollback", type=Path, default=None, help="Restore NVDM backup file bit-for-bit.")
+    parser.add_argument("--inject", dest="flag_inject", action="store_true", help="Send synthesized coefficients via NCOPTSET.")
+    parser.add_argument("--verify", dest="flag_verify", action="store_true", help="Check NCOPTGET state (DSP coefficient data present).")
+    parser.add_argument("--rollback", dest="flag_rollback", type=Path, default=None, help="Reset optimizer coefficients to identity via NCOPTSET.")
     parser.add_argument("--level", type=int, default=None, help="anc ambient: ambient sound level 1..20.")
     parser.add_argument("--voice", action="store_true", default=False, help="anc ambient: enable focus on voice.")
     parser.add_argument("--allow-unknown-firmware", action="store_true", default=False, help="flash: allow a file whose SHA-256 is not a known official image.")
-    parser.add_argument("--allow-unverified-write", action="store_true", default=False, help="Allow inject/rollback on real hardware even though they are not hardware-validated.")
+    parser.add_argument("--allow-unverified-write", action="store_true", default=False, help="Allow inject/rollback on real hardware (NCOPTSET power-cycle persistence not yet proven).")
     parser.add_argument("--target-gain", type=float, default=7.5, help="Target 50-800 Hz boost in dB (+6.0 to +9.0).")
     parser.add_argument("--sample-rate", type=float, default=48000.0, help="DSP sampling rate in Hz.")
-    parser.add_argument("--filter-id", type=int, default=FILTER_ID_ALIGN_FF_L, help="CXD90050 filter ID (0..3).")
     parser.add_argument("--backup-out", type=Path, default=None, help="Optional pre-flight backup file path.")
     parser.add_argument("--image", dest="image_path", type=Path, default=None, help="Optional NVDM binary image path.")
     parser.add_argument(
         "positional",
         nargs="*",
-        help="Subcommand: backup (dump NVDM), flash (full official FOTA firmware install), inject (surgical 108B NVDM write), dry-run, verify, rollback, parse, optimize, anc, spatial, status.",
+        help="Subcommand: backup, flash, inject, dry-run, verify, rollback, parse, optimize, anc, spatial, status.",
     )
     return parser
 
@@ -521,8 +502,7 @@ def run_cli(
     if subcmd == "parse" and subarg is not None:
         return _run_parse_workflow(transport=None, image_path=Path(subarg))
 
-    # Real Hardware Hardware Backup Subcommand:
-    # If not in mock mode and no custom mock transport is injected, use proven hardware method directly!
+    # Real Hardware Backup Subcommand:
     custom_transport = obj.get("transport") if obj else None
     if subcmd == "backup" and not ns.mock and custom_transport is None:
         effective_mac = _resolve_target_mac(ns.mac)
@@ -537,13 +517,13 @@ def run_cli(
             print(f"ERROR: Real hardware backup failed: {e}")
             return 1
 
-    # The inject/rollback write paths model a 108-byte DNC/ALIGN_* biquad item that does not
-    # match a real WH-1000XM4 NVDM dump (see docs/STATUS.md), so refuse them on hardware.
+    # NCOPTSET write paths are not yet proven persistent across power cycles,
+    # so refuse them on real hardware unless the user accepts the risk.
     wants_write = subcmd in ("inject", "rollback") or ns.flag_inject or ns.flag_rollback is not None
     if wants_write and not ns.mock and custom_transport is None and not ns.allow_unverified_write:
         print(
-            "ERROR: inject/rollback are not validated on real hardware and are disabled.\n"
-            "       Their NVDM model does not match a real WH-1000XM4 dump (see docs/STATUS.md).\n"
+            "ERROR: inject/rollback via NCOPTSET are not yet verified for NVDM persistence.\n"
+            "       Power-cycle verification is pending (see docs/STATUS.md).\n"
             "       Use --mock to simulate, or --allow-unverified-write if you accept the risk."
         )
         return 2
@@ -566,7 +546,6 @@ def run_cli(
                 transport=transport,
                 target_gain=ns.target_gain,
                 sample_rate=ns.sample_rate,
-                filter_id=ns.filter_id,
                 image_path=ns.image_path,
             )
 
@@ -575,17 +554,11 @@ def run_cli(
                 transport=transport,
                 target_gain=ns.target_gain,
                 sample_rate=ns.sample_rate,
-                filter_id=ns.filter_id,
                 backup_out=ns.backup_out,
             )
 
         if subcmd == "verify":
-            return _run_verify_workflow(
-                transport=transport,
-                target_gain=ns.target_gain,
-                sample_rate=ns.sample_rate,
-                filter_id=ns.filter_id,
-            )
+            return _run_verify_workflow(transport=transport)
 
         if subcmd == "rollback":
             if subarg is None:
@@ -612,7 +585,6 @@ def run_cli(
                 transport=transport,
                 target_gain=ns.target_gain,
                 sample_rate=ns.sample_rate,
-                filter_id=ns.filter_id,
                 image_path=ns.image_path,
             )
 
@@ -621,17 +593,11 @@ def run_cli(
                 transport=transport,
                 target_gain=ns.target_gain,
                 sample_rate=ns.sample_rate,
-                filter_id=ns.filter_id,
                 backup_out=ns.backup_out,
             )
 
         if ns.flag_verify:
-            return _run_verify_workflow(
-                transport=transport,
-                target_gain=ns.target_gain,
-                sample_rate=ns.sample_rate,
-                filter_id=ns.filter_id,
-            )
+            return _run_verify_workflow(transport=transport)
 
         parser.print_help()
         return 0
@@ -639,6 +605,7 @@ def run_cli(
     except (
         ValueError,
         FileNotFoundError,
+        DryRunItemNotFoundError,
         InjectionError,
         UnstableFilterHoldError,
         VerificationError,

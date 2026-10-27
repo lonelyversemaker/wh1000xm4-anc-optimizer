@@ -1,7 +1,8 @@
 """Airoha NVDM and Sony CXD90050 Parameter Subsystem.
 
 Provides full parsing, validation, serialization, and parameter extraction
-for the 128KB Airoha NVDM partition and CXD90050 (QN1) DSP calibration blocks.
+for the Airoha NVDM partition (512 KB on hardware, 128 KB on mock) and
+CXD90050 (QN1) DSP calibration blocks.
 """
 
 from __future__ import annotations
@@ -19,6 +20,12 @@ from xm4_optimizer.nvdm.cxd90050 import (
     float_to_q28,
     HowlingDetectionParam,
     HowlingPreventionParam,
+    OptimizerCoefficient,
+    OPTIMIZER_COEFF_GROUP,
+    OPTIMIZER_COEFF_IDENTITY,
+    OPTIMIZER_COEFF_ITEM,
+    OPTIMIZER_COEFF_SIZE,
+    OPTIMIZER_COEFF_WORDS,
     OptimizerParam,
     q28_to_float,
     Q28_MAX_INT,
@@ -53,6 +60,7 @@ from xm4_optimizer.nvdm.parser import (
     serialize_nvdm_partition,
 )
 from xm4_optimizer.nvdm.peb import (
+    LEGACY_PARTITION_SIZE,
     NVDM_BASE_ADDRESS,
     NVDM_PARTITION_SIZE,
     parse_peb_header,
@@ -114,6 +122,13 @@ __all__ = [
     "deserialize_alignment_block",
     "HowlingPreventionParam",
     "HowlingDetectionParam",
+    "LEGACY_PARTITION_SIZE",
+    "OptimizerCoefficient",
+    "OPTIMIZER_COEFF_GROUP",
+    "OPTIMIZER_COEFF_IDENTITY",
+    "OPTIMIZER_COEFF_ITEM",
+    "OPTIMIZER_COEFF_SIZE",
+    "OPTIMIZER_COEFF_WORDS",
     "OptimizerParam",
     # Partition Parser
     "is_newer_sequence",

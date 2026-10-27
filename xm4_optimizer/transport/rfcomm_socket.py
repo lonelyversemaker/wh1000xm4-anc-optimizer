@@ -29,7 +29,7 @@ DEFAULT_TIMEOUT_S: float = 3.0
 DEFAULT_RETRY_COUNT: int = 5
 DEFAULT_BACKOFF_FACTOR: float = 0.2
 NVDM_PARTITION_BASE: int = 0x000DF000
-NVDM_PARTITION_SIZE: int = 0x20000  # 128 KB (512 pages of 256 bytes)
+NVDM_PARTITION_SIZE: int = 0x80000  # 512 KB (2048 pages of 256 bytes)
 
 
 def create_rfcomm_socket(bd_addr: str, channel: int, timeout_s: float = DEFAULT_TIMEOUT_S) -> socket.socket:
@@ -297,7 +297,7 @@ def read_nvdm_partition(
     size: int = NVDM_PARTITION_SIZE,
     progress_callback: Optional[Callable[[int, int], None]] = None,
 ) -> bytes:
-    """Reads 128KB partition image as contiguous bytes (512 pages of 256 bytes)."""
+    """Reads NVDM partition image as contiguous bytes (default 512 KB = 2048 pages of 256 bytes)."""
     if size % FLASH_PAGE_SIZE != 0:
         raise ValueError(f"Partition size 0x{size:X} must be a multiple of 256 bytes")
 
