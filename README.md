@@ -6,7 +6,7 @@
 [![Python 3.10+](https://img.shields.io/badge/python-3.10+-3776AB.svg?logo=python&logoColor=white)](pyproject.toml)
 [![Email](https://img.shields.io/badge/email-randward%40proton.me-6d4aff.svg?logo=protonmail&logoColor=white)](mailto:randward@proton.me)
 
-Open tools for the **Sony WH-1000XM4** over Bluetooth on Linux: back up and inspect the headset's NVDM settings store, flash official Sony firmware (including downgrades), switch ANC modes, apply EQ presets, and an experimental spatial-audio prototype. The goal is to grow this into a toolkit for other Sony headphones built on the same Airoha-based platform.
+Open tools for the **Sony WH-1000XM4** over Bluetooth on Linux: back up and inspect the headset's NVDM settings store, flash official Sony firmware (including downgrades), switch ANC modes, read and write device RAM over RACE, apply EQ presets, and an experimental spatial-audio prototype. Includes firmware reverse-engineering notes for the Airoha AB1562 platform. The goal is to grow this into a toolkit for other Sony headphones built on the same chipset.
 
 > **Unofficial project.** Not affiliated with, endorsed by or supported by Sony. Use at your own risk: writing to a headset can damage it and may void your warranty.
 
@@ -21,9 +21,12 @@ Every claim in this repository is graded by evidence in **[docs/STATUS.md](docs/
 | Flash official Sony firmware, e.g. downgrade 3.0.1 → 2.5.0 | `python3 tools/flash_firmware.py --mac <MAC> --firmware <file.bin>` | Device-verified in both directions between 2.5.0 and 3.0.1 ([test record](docs/research/ANC_FIRMWARE_COMPARISON.md)) |
 | Read firmware version, battery and ANC mode | `python3 -m xm4_optimizer status` | Device-verified |
 | Switch noise cancelling / ambient / wind / off | `python3 -m xm4_optimizer anc nc\|ambient [--level 1-20] [--voice]\|wind\|off\|status` | Device-verified, with readback |
+| Read/write device RAM via RACE | `tools/verify_coefset.py`, `tools/post_cycle_verify.py` | Device-verified; READ_ADDRESS (`0x1680`) and WRITE_ADDRESS (`0x1681`) work without authentication |
+| RACE protocol dispatch table and firmware analysis | — | Firmware-verified; full command table mapped, NVDM handler structure identified ([details](docs/STATUS.md#hardware-access)) |
 | EQ presets for EasyEffects and Equalizer APO | [`presets/`](presets) | Ready to use |
 | ANC filter synthesis and dry-run | `python3 -m xm4_optimizer --mock --dry-run` | Simulation only |
 | `inject` / `verify` / `rollback` of ANC filters | — | **Disabled on hardware.** Their storage model is contradicted by a real dump ([details](docs/STATUS.md#anc-calibration-inject-verify-rollback)). They run with `--mock` only. |
+| Persistent ANC coefficient injection | — | **In progress.** RAM injection tested (3 power-cycle attempts), NVDM persistence not yet achieved. See [STATUS.md](docs/STATUS.md) for details. |
 | Spatial audio (AeroSpatial: PipeWire + Steam Audio) | see [aerospatial/pipewire/README.md](aerospatial/pipewire/README.md) | Experimental; failed its first listening test |
 | Custom voice prompt packs | — | Planned ([Roadmap](#roadmap)) |
 
@@ -131,9 +134,10 @@ The tests run against an in-memory emulator. Passing tests do not show that a wr
 ## Roadmap
 
 1. **Repository hygiene (done 2026-10-26):** English documentation, evidence ledger, write commands disabled on hardware, licence fixed.
-2. **Device-proven tools into the package:** move the tested backup and flash code paths into the library, check firmware files against known hashes, and add **voice-pack** commands (extract, build, install) using the same upload sequence as Sony's app ([fix-whxm4-voice](https://github.com/aaron-p1/fix-whxm4-voice) documents it).
-3. **More Sony models:** per-model profiles, a dump → partition extraction → **redaction** workflow so owners can share data safely, and a contributor guide for forks.
-4. **Apps:** Linux, Windows and Android front ends on a shared core. On Android, features that need root are listed in the normal app and marked "root only".
+2. **Firmware reverse engineering (in progress):** Full Ghidra decompilation of v2.5.0 firmware, RACE dispatch table mapped, NVDM handler structure identified. NC Optimizer data flow partially traced. Goal: identify the exact power-off save path for `config/optimizer_coeff` to enable persistent ANC coefficient injection.
+3. **Device-proven tools into the package:** move the tested backup and flash code paths into the library, check firmware files against known hashes, and add **voice-pack** commands (extract, build, install) using the same upload sequence as Sony's app ([fix-whxm4-voice](https://github.com/aaron-p1/fix-whxm4-voice) documents it).
+4. **More Sony models:** per-model profiles, a dump → partition extraction → **redaction** workflow so owners can share data safely, and a contributor guide for forks.
+5. **Apps:** Linux, Windows and Android front ends on a shared core. On Android, features that need root are listed in the normal app and marked "root only".
 
 ## License
 
