@@ -1,5 +1,7 @@
 # wh1000xm4-anc-optimizer
 
+> **Fork with macOS support.** This is [lonelyversemaker/wh1000xm4-anc-optimizer](https://github.com/lonelyversemaker/wh1000xm4-anc-optimizer), a fork of [randwardatake/wh1000xm4-anc-optimizer](https://github.com/randwardatake/wh1000xm4-anc-optimizer) that adds macOS (IOBluetooth) support (offered upstream as [PR #3](https://github.com/randwardatake/wh1000xm4-anc-optimizer/pull/3)). It is the backend for the desktop app [XM4 Firmware Tool](https://github.com/lonelyversemaker/xm4-gui). See [macOS](#macos) below.
+
 [![CI](https://github.com/randwardatake/wh1000xm4-anc-optimizer/actions/workflows/ci.yml/badge.svg)](https://github.com/randwardatake/wh1000xm4-anc-optimizer/actions/workflows/ci.yml)
 [![Version](https://img.shields.io/badge/version-v0.1.0-blue.svg)](pyproject.toml)
 [![License: GPL-3.0-or-later](https://img.shields.io/badge/license-GPL--3.0--or--later-blue.svg)](LICENSE)
