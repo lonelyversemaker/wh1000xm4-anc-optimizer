@@ -5,30 +5,38 @@ biquad IIR DSP coefficient synthesis, dry-run simulation, and safe injection
 for Sony WH-1000XM4 active noise cancellation.
 """
 
-from xm4_optimizer.dsp import (
-    BiquadCoefficients,
-    SynthesisResult,
-    synthesize_anc_filter,
-    verify_nyquist_stability,
-)
-from xm4_optimizer.nvdm import (
-    CXD90050AlignmentBlock,
-    NvdmPartition,
-    OptimizerCoefficient,
-    extract_cxd90050_blocks,
-    parse_nvdm_image,
-)
-from xm4_optimizer.safety import (
-    execute_dry_run,
-    execute_injection,
-    execute_rollback,
-    verify_readback,
-)
-from xm4_optimizer.transport import (
-    BluetoothRfcommTransport,
-    DeviceTransport,
-    VirtualXM4Device,
-)
+from importlib import import_module
+
+# Exports load on first access, so importing a light submodule (transport,
+# firmware) does not pull in numpy through the DSP package.
+_EXPORTS = {
+    "BiquadCoefficients": "xm4_optimizer.dsp",
+    "SynthesisResult": "xm4_optimizer.dsp",
+    "synthesize_anc_filter": "xm4_optimizer.dsp",
+    "verify_nyquist_stability": "xm4_optimizer.dsp",
+    "CXD90050AlignmentBlock": "xm4_optimizer.nvdm",
+    "NvdmPartition": "xm4_optimizer.nvdm",
+    "OptimizerCoefficient": "xm4_optimizer.nvdm",
+    "extract_cxd90050_blocks": "xm4_optimizer.nvdm",
+    "parse_nvdm_image": "xm4_optimizer.nvdm",
+    "execute_dry_run": "xm4_optimizer.safety",
+    "execute_injection": "xm4_optimizer.safety",
+    "execute_rollback": "xm4_optimizer.safety",
+    "verify_readback": "xm4_optimizer.safety",
+    "BluetoothRfcommTransport": "xm4_optimizer.transport",
+    "DeviceTransport": "xm4_optimizer.transport",
+    "VirtualXM4Device": "xm4_optimizer.transport",
+}
+
+
+def __getattr__(name: str):
+    module = _EXPORTS.get(name)
+    if module is None:
+        raise AttributeError(f"module 'xm4_optimizer' has no attribute {name!r}")
+    value = getattr(import_module(module), name)
+    globals()[name] = value
+    return value
+
 
 __version__ = "0.1.0"
 
